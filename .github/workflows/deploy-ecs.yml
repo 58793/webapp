@@ -1,23 +1,25 @@
-name: Build and Deploy to ECS
+name: Deploy to ECS (Fargate)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
   AWS_REGION: us-east-1
-  ECR_REPO: myproject-dev-app
+  ECR_REPOSITORY: myproject-dev-app
   ECS_CLUSTER: myproject-dev-cluster
   ECS_SERVICE: myproject-dev-service
-  ECS_CONTAINER_NAME: app
+  ECS_TASK_DEFINITION_FAMILY: myproject-dev-task
+  CONTAINER_NAME: app
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
       - name: Checkout
@@ -26,59 +28,75 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::120569640932:role/github-actions-ecs-deploy
+          role-to-assume: arn:aws:iam::120569640932:role/GitHubActionsEcsDeployRole
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      - name: Build, tag, and push image to ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG
-          echo "image=$ECR_REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          IMAGE_URI="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
 
       - name: Render new task definition (update image)
-        id: taskdef
-        env:
-          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+        id: render-td
         run: |
           aws ecs describe-task-definition \
-            --task-definition myproject-dev-task \
+            --task-definition "${{ env.ECS_TASK_DEFINITION_FAMILY }}" \
             --query taskDefinition > taskdef.json
 
-          jq 'del(
-              .taskDefinitionArn,.revision,.status,.requiresAttributes,
-              .compatibilities,.registeredAt,.registeredBy
-            )
-            | (.containerDefinitions[] | select(.name=="${{ env.ECS_CONTAINER_NAME }}") | .image) = env.IMAGE_URI
-          ' taskdef.json > taskdef-rendered.json
+          cat taskdef.json | jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' > taskdef-clean.json
 
-          echo "file=taskdef-rendered.json" >> $GITHUB_OUTPUT
+          cat taskdef-clean.json | jq \
+            --arg IMAGE "${{ steps.build-image.outputs.image }}" \
+            --arg NAME "${{ env.CONTAINER_NAME }}" \
+            '(.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE' \
+            > taskdef-updated.json
+
+          echo "file=taskdef-updated.json" >> $GITHUB_OUTPUT
 
       - name: Register task definition
-        id: register
+        id: register-td
         run: |
           NEW_TD_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://${{ steps.taskdef.outputs.file }} \
-            --query 'taskDefinition.taskDefinitionArn' \
+            --cli-input-json file://${{ steps.render-td.outputs.file }} \
+            --query "taskDefinition.taskDefinitionArn" \
             --output text)
-          echo "td=$NEW_TD_ARN" >> $GITHUB_OUTPUT
-          echo "Registered: $NEW_TD_ARN"
+          echo "arn=$NEW_TD_ARN" >> $GITHUB_OUTPUT
+          echo "New task definition: $NEW_TD_ARN"
 
-      - name: Update ECS service
+      - name: Update ECS service to new task definition
         run: |
           aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --task-definition ${{ steps.register.outputs.td }}
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --task-definition "${{ steps.register-td.outputs.arn }}" \
+            --force-new-deployment
 
-      - name: Wait for service stability
+      - name: Wait for service to be stable
         run: |
           aws ecs wait services-stable \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }}
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}"
+
+      - name: Smoke test /health via ALB (optional)
+        run: |
+          ALB_DNS="myproject-dev-alb-304939202.us-east-1.elb.amazonaws.com"
+          curl -fsS "http://$ALB_DNS/health"
+          echo "✅ /health OK"
