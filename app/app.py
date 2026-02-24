@@ -1,5 +1,6 @@
 import os
-from flask import Flask
+import socket
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
@@ -10,4 +11,8 @@ def home():
 
 @app.get("/health")
 def health():
-    return "ok\n"
+    return jsonify(
+        status="ok",
+        version=os.getenv("APP_VERSION", "unknown"),
+        hostname=socket.gethostname(),
+    )
