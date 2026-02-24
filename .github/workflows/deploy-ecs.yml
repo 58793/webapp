@@ -35,25 +35,35 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to ECR
+      # ✅ ensures multi-arch builds work cleanly
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push image to ECR (linux/amd64)
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           IMAGE_URI="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
-          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-      - name: Render new task definition (update image)
+          docker buildx build \
+            --platform linux/amd64 \
+            -t "$IMAGE_URI" \
+            --push \
+            .
+
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Render new task definition (update image + APP_VERSION)
         id: render-td
         run: |
           aws ecs describe-task-definition \
             --task-definition "${{ env.ECS_TASK_DEFINITION_FAMILY }}" \
             --query taskDefinition > taskdef.json
 
-          cat taskdef.json | jq 'del(
+          jq 'del(
             .taskDefinitionArn,
             .revision,
             .status,
@@ -61,13 +71,23 @@ jobs:
             .compatibilities,
             .registeredAt,
             .registeredBy
-          )' > taskdef-clean.json
+          )' taskdef.json > taskdef-clean.json
 
-          cat taskdef-clean.json | jq \
+          jq \
             --arg IMAGE "${{ steps.build-image.outputs.image }}" \
             --arg NAME "${{ env.CONTAINER_NAME }}" \
-            '(.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE' \
-            > taskdef-updated.json
+            --arg APP_VERSION "${{ steps.build-image.outputs.tag }}" \
+            '
+            # update image
+            (.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE
+            |
+            # ensure env array exists
+            (.containerDefinitions[] | select(.name==$NAME) | .environment) |= (. // [])
+            |
+            # remove any old APP_VERSION and add new one
+            (.containerDefinitions[] | select(.name==$NAME) | .environment) |=
+              ([ .[] | select(.name != "APP_VERSION") ] + [{ "name": "APP_VERSION", "value": $APP_VERSION }])
+            ' taskdef-clean.json > taskdef-updated.json
 
           echo "file=taskdef-updated.json" >> $GITHUB_OUTPUT
 
@@ -95,7 +115,7 @@ jobs:
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_SERVICE }}"
 
-      - name: Smoke test /health via ALB (optional)
+      - name: Smoke test /health via ALB
         run: |
           ALB_DNS="myproject-dev-alb-304939202.us-east-1.elb.amazonaws.com"
           curl -fsS "http://$ALB_DNS/health"
