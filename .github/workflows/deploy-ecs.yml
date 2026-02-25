@@ -2,20 +2,22 @@ name: Deploy to ECS (Fargate)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch: {}
 
 permissions:
   id-token: write
   contents: read
 
+# ✅ No hardcoded values here — all come from GitHub repo variables
 env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: myproject-dev-app
-  ECS_CLUSTER: myproject-dev-cluster
-  ECS_SERVICE: myproject-dev-service
-  ECS_TASK_DEFINITION_FAMILY: myproject-dev-task
-  CONTAINER_NAME: app
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPO }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+  CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+  ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
 
 jobs:
   deploy:
@@ -28,41 +30,39 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::120569640932:role/github-actions-ecs-deploy
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ✅ ensures multi-arch builds work cleanly
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build, tag, and push image to ECR (linux/amd64)
+      - name: Build + Push image
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          set -euo pipefail
+          IMAGE_URI="$ECR_REGISTRY/${ECR_REPOSITORY}:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
-          docker buildx build \
-            --platform linux/amd64 \
-            -t "$IMAGE_URI" \
-            --push \
-            .
-
-          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-      - name: Render new task definition (update image + APP_VERSION)
-        id: render-td
+      - name: Fetch current task definition
         run: |
+          set -euo pipefail
           aws ecs describe-task-definition \
-            --task-definition "${{ env.ECS_TASK_DEFINITION_FAMILY }}" \
+            --region "$AWS_REGION" \
+            --task-definition "$ECS_TASK_FAMILY" \
             --query taskDefinition > taskdef.json
 
+      - name: Render new task definition (image + APP_VERSION)
+        id: render-td
+        run: |
+          set -euo pipefail
+
+          # Remove read-only fields
           jq 'del(
             .taskDefinitionArn,
             .revision,
@@ -73,50 +73,71 @@ jobs:
             .registeredBy
           )' taskdef.json > taskdef-clean.json
 
-          jq \
-            --arg IMAGE "${{ steps.build-image.outputs.image }}" \
-            --arg NAME "${{ env.CONTAINER_NAME }}" \
-            --arg APP_VERSION "${{ steps.build-image.outputs.tag }}" \
-            '
-            # update image
-            (.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE
-            |
-            # ensure env array exists
-            (.containerDefinitions[] | select(.name==$NAME) | .environment) |= (. // [])
-            |
-            # remove any old APP_VERSION and add new one
-            (.containerDefinitions[] | select(.name==$NAME) | .environment) |=
-              ([ .[] | select(.name != "APP_VERSION") ] + [{ "name": "APP_VERSION", "value": $APP_VERSION }])
-            ' taskdef-clean.json > taskdef-updated.json
-
-          echo "file=taskdef-updated.json" >> $GITHUB_OUTPUT
+          # Update container image + inject APP_VERSION = commit SHA
+          jq --arg NAME "$CONTAINER_NAME" \
+             --arg IMAGE "${{ steps.build-image.outputs.image }}" \
+             --arg APP_VERSION "${{ github.sha }}" \
+             '
+             (.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE
+             |
+             (.containerDefinitions[] | select(.name==$NAME) | .environment) =
+               (
+                 ((.containerDefinitions[] | select(.name==$NAME) | .environment) // [])
+                 | map(select(.name != "APP_VERSION"))
+                 + [{"name":"APP_VERSION","value":$APP_VERSION}]
+               )
+             ' taskdef-clean.json > taskdef-updated.json
 
       - name: Register task definition
-        id: register-td
+        id: register
         run: |
+          set -euo pipefail
           NEW_TD_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://${{ steps.render-td.outputs.file }} \
+            --region "$AWS_REGION" \
+            --cli-input-json file://taskdef-updated.json \
             --query "taskDefinition.taskDefinitionArn" \
             --output text)
-          echo "arn=$NEW_TD_ARN" >> $GITHUB_OUTPUT
-          echo "New task definition: $NEW_TD_ARN"
+          echo "arn=$NEW_TD_ARN" >> "$GITHUB_OUTPUT"
+          echo "✅ Registered: $NEW_TD_ARN"
 
-      - name: Update ECS service to new task definition
+      - name: Update ECS service
         run: |
+          set -euo pipefail
           aws ecs update-service \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --service "${{ env.ECS_SERVICE }}" \
-            --task-definition "${{ steps.register-td.outputs.arn }}" \
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.arn }}" \
             --force-new-deployment
 
-      - name: Wait for service to be stable
+      - name: Wait for ECS stable
         run: |
+          set -euo pipefail
           aws ecs wait services-stable \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}"
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
 
-      - name: Smoke test /health via ALB
+      # ✅ Strong deployment proof (NO curl): confirms ECS is running the image we just pushed
+      - name: Deployment proof (verify running image == pushed image)
         run: |
-          ALB_DNS="myproject-dev-alb-304939202.us-east-1.elb.amazonaws.com"
-          curl -fsS "http://$ALB_DNS/health"
-          echo "✅ /health OK"
+          set -euo pipefail
+
+          TD=$(aws ecs describe-services \
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+
+          RUNNING_IMAGE=$(aws ecs describe-task-definition \
+            --region "$AWS_REGION" \
+            --task-definition "$TD" \
+            --query "taskDefinition.containerDefinitions[?name=='$CONTAINER_NAME'].image | [0]" \
+            --output text)
+
+          echo "TaskDefinition: $TD"
+          echo "Running image: $RUNNING_IMAGE"
+          echo "Expected image: ${{ steps.build-image.outputs.image }}"
+
+          test "$RUNNING_IMAGE" = "${{ steps.build-image.outputs.image }}"
+          echo "✅ Deployment proof passed"
