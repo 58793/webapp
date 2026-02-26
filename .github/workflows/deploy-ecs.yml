@@ -1,15 +1,19 @@
-name: Deploy to ECS (Fargate)
+name: CD (deploy to ECS)
 
 on:
-  push:
-    branches: ["main"]
+  workflow_run:
+    workflows: ["CI (tests)"]   
+    types: [completed]
   workflow_dispatch: {}
 
 permissions:
   id-token: write
   contents: read
 
-# ✅ No hardcoded values here — all come from GitHub repo variables
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPO }}
@@ -21,11 +25,19 @@ env:
 
 jobs:
   deploy:
+    # Run if manually triggered OR CI workflow succeeded on main
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (exact commit that passed CI)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -37,15 +49,22 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build + Push image
+      - name: Set image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build + Push image (linux/amd64)
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ steps.meta.outputs.sha }}
         run: |
           set -euo pipefail
           IMAGE_URI="$ECR_REGISTRY/${ECR_REPOSITORY}:$IMAGE_TAG"
-          docker build -t "$IMAGE_URI" .
+          docker build --platform linux/amd64 -t "$IMAGE_URI" .
           docker push "$IMAGE_URI"
           echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
@@ -58,11 +77,9 @@ jobs:
             --query taskDefinition > taskdef.json
 
       - name: Render new task definition (image + APP_VERSION)
-        id: render-td
         run: |
           set -euo pipefail
 
-          # Remove read-only fields
           jq 'del(
             .taskDefinitionArn,
             .revision,
@@ -73,10 +90,9 @@ jobs:
             .registeredBy
           )' taskdef.json > taskdef-clean.json
 
-          # Update container image + inject APP_VERSION = commit SHA
           jq --arg NAME "$CONTAINER_NAME" \
              --arg IMAGE "${{ steps.build-image.outputs.image }}" \
-             --arg APP_VERSION "${{ github.sha }}" \
+             --arg APP_VERSION "${{ steps.meta.outputs.sha }}" \
              '
              (.containerDefinitions[] | select(.name==$NAME) | .image) = $IMAGE
              |
@@ -118,7 +134,6 @@ jobs:
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE"
 
-      # ✅ Strong deployment proof (NO curl): confirms ECS is running the image we just pushed
       - name: Deployment proof (verify running image == pushed image)
         run: |
           set -euo pipefail
